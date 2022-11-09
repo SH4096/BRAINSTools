@@ -1,0 +1,438 @@
+#! /usr/bin/env python
+"""
+singleSession.py
+===================
+This program is used to generate the subject- and session-specific workflows for BRAINSTool processing
+
+Usage:
+  singleSession.py [--rewrite-datasinks] [--wfrun PLUGIN] [--use-sentinal] [--dry-run] --workphase WORKPHASE --pe ENV --ExperimentConfig FILE SESSIONS...
+  singleSession.py -v | --version
+  singleSession.py -h | --help
+
+Arguments:
+  SESSIONS              List of sessions to process. Specifying 'all' processes every session in
+                        the database (specified in the --ExperimentConfig FILE)
+
+Options:
+  -h, --help            Show this help and exit
+  -v, --version         Print the version and exit
+  --rewrite-datasinks   Turn on the Nipype option to overwrite all files in the 'results' directory
+  --use-sentinal        Use the t1_average file as a marker to determine if session needs to be run
+  --dry-run             Do not submit jobs, but print diagnostics about which jobs would be run
+  --pe ENV              The processing environment to use from configuration file
+  --wfrun PLUGIN        The name of the workflow plugin option (default: 'local')
+  --workphase WORKPHASE The type of processing to be done [atlas-based-reference|subject-based-reference]
+  --ExperimentConfig FILE   The configuration file
+
+
+Examples:
+  $ singleSession.py --pe OSX --ExperimentConfig my_baw.config all
+  $ singleSession.py --use-sentinal --wfrun SGEGraph --pe OSX --ExperimentConfig my_baw.config 00001 00002
+  $ singleSession.py --use-sentinal --dry-run --wfrun SGEGraph --pe OSX --ExperimentConfig my_baw.config 00001 00002
+  $ singleSession.py --rewrite-datasinks --pe OSX --ExperimentConfig my_baw.config 00003
+
+"""
+import re
+
+
+def _create_single_session(dataDict, master_config, interpMode, pipeline_name):
+    """
+    Create singleSession workflow on a single session
+
+    This is the main function to call when processing a data set with T1 & T2
+    data.  ExperimentBaseDirectoryPrefix is the base of the directory to place results, T1Images & T2Images
+    are the lists of images to be used in the auto-workup. atlas_fname_wpath is
+    the path and filename of the atlas to use.
+
+    :param dataDict:
+    :param master_config:
+    :param interpMode:
+    :param pipeline_name:
+    :return:
+    """
+    assert (
+        "tissue_classify" in master_config["components"]
+        or "auxlmk" in master_config["components"]
+        or "denoise" in master_config["components"]
+        or "landmark" in master_config["components"]
+        or "segmentation" in master_config["components"]
+        or "jointfusion_2015_wholebrain" in master_config["components"]
+    )
+
+    from nipype import config, logging
+
+    config.update_config(master_config)  # Set universal pipeline options
+    logging.update_logging(config)
+
+    from BAW.workflows.baseline import generate_single_session_template_wf
+
+    project = dataDict["project"]
+    subject = dataDict["subject"]
+    session = dataDict["session"]
+
+    blackListFileName = dataDict["T1s"][0] + "_noDenoise"
+    isBlackList = os.path.isfile(blackListFileName)
+
+    pname = "{0}_{1}_{2}".format(master_config["workflow_phase"], subject, session)
+    onlyT1 = not (len(dataDict["T2s"]) > 0)
+    hasPDs = len(dataDict["PDs"]) > 0
+    hasFLs = len(dataDict["FLs"]) > 0
+    if onlyT1:
+        print("T1 Only processing starts ...")
+    else:
+        print("Multimodal processing starts ...")
+
+    doDenoise = False
+    if "denoise" in master_config["components"]:
+        if isBlackList:
+            print(
+                """
+                  Denoise is ignored when the session is in Blacklist
+                  There is known issue that Landmark Detection algorithm
+                  may not work well with denoising step
+                  """
+            )
+            doDenoise = False
+        else:
+            doDenoise = True
+    useEMSP = None
+    if len(dataDict["EMSP"]) > 0:
+        useEMSP = dataDict["EMSP"][0]
+
+    def replace_image_extensions(filename, new_extension):
+        filename_base = filename
+        for rmext in [
+            r".gz$",
+            r".nii$",
+            r".hdr$",
+            r".img$",
+            r".dcm$",
+            r".nrrd$",
+            r".nhdr$",
+            r".mhd$",
+        ]:
+            filename_base = re.sub(rmext, "", filename_base)
+        return filename_base + new_extension
+
+    input_sidecare_fcsv_filename = replace_image_extensions(dataDict["T1s"][0], ".fcsv")
+    if os.path.exists(input_sidecare_fcsv_filename):
+        useEMSP = input_sidecare_fcsv_filename
+
+    sessionWorkflow = generate_single_session_template_wf(
+        project,
+        subject,
+        session,
+        onlyT1,
+        hasPDs,
+        hasFLs,
+        master_config,
+        phase=master_config["workflow_phase"],
+        interpMode=interpMode,
+        pipeline_name=pipeline_name,
+        doDenoise=doDenoise,
+        badT2=dataDict["BadT2"],
+        useEMSP=useEMSP,
+    )
+    sessionWorkflow.base_dir = master_config["cachedir"]
+
+    sessionWorkflow_inputsspec = sessionWorkflow.get_node("inputspec")
+    sessionWorkflow_inputsspec.inputs.T1s = dataDict["T1s"]
+    sessionWorkflow_inputsspec.inputs.T2s = dataDict["T2s"]
+    sessionWorkflow_inputsspec.inputs.PDs = dataDict["PDs"]
+    sessionWorkflow_inputsspec.inputs.FLs = dataDict["FLs"]
+    if useEMSP is not None:
+        sessionWorkflow_inputsspec.inputs.EMSP = useEMSP
+    sessionWorkflow_inputsspec.inputs.OTHERs = dataDict["OTHERs"]
+    return sessionWorkflow
+
+
+def create_and_run(
+    sessions, environment, experiment, pipeline, cluster, useSentinal, dryRun
+):
+    """
+    This function...
+
+    :param sessions:
+    :param environment:
+    :param experiment:
+    :param pipeline:
+    :param cluster:
+    :param useSentinal:
+    :param dryRun:
+    :return:
+    """
+    from BAW.baw_exp import open_subject_database
+    from BAW.utilities.misc import add_dict
+    from collections import OrderedDict
+    import sys
+    from collections import (
+        OrderedDict,
+    )  # Need OrderedDict internally to ensure consistent ordering
+
+    from BAW.workflows.utils import run_workflow
+
+    master_config = OrderedDict()
+    for configDict in [environment, experiment, pipeline, cluster]:
+        master_config = add_dict(master_config, configDict)
+
+    try:
+        database = open_subject_database(
+            experiment["cachedir"], ["all"], environment["prefix"], experiment["dbfile"]
+        )
+        # We only need to read from the database as this point
+        database.open_connection(read_only=True)
+        all_sessions = database.get_all_sessions()
+        if not set(sessions) <= set(all_sessions) and "all" not in sessions:
+            missing = set(sessions) - set(all_sessions)
+            assert (
+                len(missing) == 0
+            ), "Requested sessions are missing from the database: {0}\n\n{1}".format(
+                missing, all_sessions
+            )
+        elif "all" in sessions:
+            sessions = set(all_sessions)
+        else:
+            sessions = set(sessions)
+        print(("!=" * 40))
+        print(("Doing sessions {0}".format(sessions)))
+        print(("!=" * 40))
+        for session in sessions:
+            _dict = OrderedDict()
+            t1_list = database.get_filenames_by_scan_type(session, ["T1-15", "T1-30"])
+            if len(t1_list) == 0:
+                print(
+                    (
+                        "ERROR: Skipping session {0} for subject {1} due to missing T1's".format(
+                            session, subject
+                        )
+                    )
+                )
+                print("REMOVE OR FIX BEFORE CONTINUING")
+                continue
+            subject = database.get_subj_from_session(session)
+            _dict["session"] = session
+            _dict["project"] = database.get_proj_from_session(session)
+            _dict["subject"] = subject
+            _dict["T1s"] = t1_list
+            _dict["T2s"] = database.get_filenames_by_scan_type(
+                session, ["T2-15", "T2-30"]
+            )
+            _dict["BadT2"] = False
+            if _dict["T2s"] == database.get_filenames_by_scan_type(session, ["T2-15"]):
+                for t2fn in _dict["T2s"]:
+                  print(f"This T2-15 is not going to be used for JointFusion {t2fn}")
+                _dict["BadT2"] = True
+            _dict["PDs"] = database.get_filenames_by_scan_type(
+                session, ["PD-15", "PD-30"]
+            )
+            _dict["FLs"] = database.get_filenames_by_scan_type(
+                session, ["FL-15", "FL-30"]
+            )
+            _dict["EMSP"] = database.get_filenames_by_scan_type(session, ["EMSP"])
+            _dict["OTHERs"] = database.get_filenames_by_scan_type(
+                session, ["OTHER-15", "OTHER-30"]
+            )
+            sentinal_file_basedir = os.path.join(
+                master_config["resultdir"],
+                _dict["project"],
+                _dict["subject"],
+                _dict["session"],
+            )
+
+            sentinal_file_list = list()
+            sentinal_file_list.append(os.path.join(sentinal_file_basedir))
+            if "denoise" in master_config["components"]:
+                # # NO SENTINAL FILE
+                pass
+
+            # # Use t1 average sentinal file if  specified.
+            if "landmark" in master_config["components"]:
+                sentinal_file_list.append(
+                    os.path.join(
+                        sentinal_file_basedir,
+                        "ACPCAlign",
+                        "landmarkInitializer_atlas_to_subject_transform.h5",
+                    )
+                )
+
+            if "tissue_classify" in master_config["components"]:
+                for tc_file in [
+                    "complete_brainlabels_seg.nii.gz",
+                    "t1_average_BRAINSABC.nii.gz",
+                ]:
+                    sentinal_file_list.append(
+                        os.path.join(sentinal_file_basedir, "TissueClassify", tc_file)
+                    )
+
+            if "warp_atlas_to_subject" in master_config["components"]:
+                warp_atlas_file_list = [
+                    "hncma_atlas.nii.gz",
+                    "l_accumben_ProbabilityMap.nii.gz",
+                    "l_caudate_ProbabilityMap.nii.gz",
+                    "l_globus_ProbabilityMap.nii.gz",
+                    "l_hippocampus_ProbabilityMap.nii.gz",
+                    "l_putamen_ProbabilityMap.nii.gz",
+                    "l_thalamus_ProbabilityMap.nii.gz",
+                    "left_hemisphere_wm.nii.gz",
+                    "phi.nii.gz",
+                    "r_accumben_ProbabilityMap.nii.gz",
+                    "r_caudate_ProbabilityMap.nii.gz",
+                    "r_globus_ProbabilityMap.nii.gz",
+                    "r_hippocampus_ProbabilityMap.nii.gz",
+                    "r_putamen_ProbabilityMap.nii.gz",
+                    "r_thalamus_ProbabilityMap.nii.gz",
+                    "rho.nii.gz",
+                    "right_hemisphere_wm.nii.gz",
+                    "template_WMPM2_labels.nii.gz",
+                    "template_headregion.nii.gz",
+                    "template_leftHemisphere.nii.gz",
+                    "template_nac_labels.nii.gz",
+                    "template_rightHemisphere.nii.gz",
+                    "template_ventricles.nii.gz",
+                    "theta.nii.gz",
+                ]
+                for ff in warp_atlas_file_list:
+                    sentinal_file_list.append(
+                        os.path.join(sentinal_file_basedir, "WarpedAtlas2Subject", ff)
+                    )
+
+            if "jointfusion_2015_wholebrain" in master_config["components"]:
+                sentinal_file_list.append(
+                    os.path.join(
+                        sentinal_file_basedir,
+                        "TissueClassify",
+                        "JointFusion_HDAtlas20_2015_lobar_label.nii.gz",
+                    )
+                )
+                sentinal_file_list.append(
+                    os.path.join(
+                        sentinal_file_basedir, "TissueClassify", "lobeVolumes_JSON.json"
+                    )
+                )
+
+            if master_config["workflow_phase"] == "atlas-based-reference":
+                atlasDirectory = os.path.join(
+                    master_config["atlascache"], "20141004_BCD", "T1_50Lmks.mdl"
+                )
+                sentinal_file_list.append(atlasDirectory)
+            else:
+                atlasDirectory = os.path.join(
+                    master_config["previousresult"], subject, "Atlas", "AVG_rho.nii.gz"
+                )
+                sentinal_file_list.append(atlasDirectory)
+                sentinal_file_list.append(
+                    os.path.join(
+                        master_config["previousresult"],
+                        subject,
+                        "Atlas",
+                        "AVG_template_headregion.nii.gz",
+                    )
+                )
+
+            if os.path.exists(atlasDirectory):
+                print(("LOOKING FOR DIRECTORY {0}".format(atlasDirectory)))
+            else:
+                print(("MISSING REQUIRED ATLAS INPUT {0}".format(atlasDirectory)))
+                print(("SKIPPING: {0} prerequisites missing".format(session)))
+                continue
+
+            assert (
+                "segmentation" not in master_config["components"]
+            ), "ERROR, segmentation (aka BRAINSCut) no longer supported"
+
+            def all_paths_exists(list_of_paths):
+                """
+                This function...
+                :param list_of_paths:
+                :return:
+                """
+                is_missing = False
+                for ff in list_of_paths:
+                    if not os.path.exists(ff):
+                        is_missing = True
+                        print(("MISSING: {0}".format(ff)))
+                        break
+                return not is_missing
+
+            if useSentinal and all_paths_exists(sentinal_file_list):
+                print(("SKIPPING: {0} exists".format(sentinal_file_list)))
+            else:
+                print("PROCESSING INCOMPLETE: at least 1 required file does not exists")
+                if not dryRun:
+                    workflow = _create_single_session(
+                        _dict,
+                        master_config,
+                        "Linear",
+                        "singleSession_{0}_{1}".format(
+                            _dict["subject"], _dict["session"]
+                        ),
+                    )
+                    print(("Starting session {0}".format(session)))
+                    # HACK Hard-coded to SGEGraph, but --wfrun is ignored completely
+                    run_workflow(
+                        workflow,
+                        plugin=master_config["plugin_name"],
+                        plugin_args=master_config["plugin_args"],
+                    )
+                else:
+                    print("EXITING WITHOUT WORK DUE TO dryRun flag")
+    except Exception as e:
+        print("Something went wrong:")
+        print(e)
+        raise
+    finally:
+        try:
+            #print("attempting to close connection")
+            database.close_connection()
+        except Exception as e:
+            print(e)
+            pass
+
+
+def single_session_main(environment, experiment, pipeline, cluster, **kwds):
+    """
+    This function...
+
+    :param environment:
+    :param experiment:
+    :param pipeline:
+    :param cluster:
+    :param **kwds:
+    :return:
+    """
+    from BAW.utilities.configFileParser import nipype_options
+
+    print("Copying Atlas directory and determining appropriate Nipype options...")
+    pipeline = nipype_options(
+        kwds, pipeline, cluster, experiment, environment
+    )  # Generate Nipype options
+    print("Getting session(s) from database...")
+    create_and_run(
+        kwds["SESSIONS"],
+        environment,
+        experiment,
+        pipeline,
+        cluster,
+        useSentinal=kwds["--use-sentinal"],
+        dryRun=kwds["--dry-run"],
+    )
+    return 0
+
+
+# #####################################
+# Set up the environment, process command line options, and start processing
+#
+if __name__ == "__main__":
+    import sys
+    import os
+
+    from docopt import docopt
+    from BAW import setup_environment
+
+    argv = docopt(__doc__, version="1.1")
+    print(argv)
+    print(("=" * 100))
+    environment, experiment, pipeline, cluster = setup_environment(argv)
+
+    exit = single_session_main(environment, experiment, pipeline, cluster, **argv)
+    sys.exit(exit)

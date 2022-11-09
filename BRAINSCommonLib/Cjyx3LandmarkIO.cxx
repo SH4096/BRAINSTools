@@ -1,0 +1,460 @@
+/*=========================================================================
+ *
+ *  Copyright SINAPSE: Scalable Informatics for Neuroscience, Processing and Software Engineering
+ *            The University of Iowa
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0.txt
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ *=========================================================================*/
+/*
+ * Author: Wei Lu
+ * at Psychiatry Imaging Lab,
+ * University of Iowa Health Care 2010
+ */
+
+#include "Cjyx3LandmarkIO.h"
+#include "itkNumberToString.h"
+#include "itkImageFileReaderException.h"
+#include <cctype>
+#include <regex>
+
+// COPIED FROM Cjyx3D
+/// Coordinate system options
+/// LPS coordinate system is used the most commonly in medical image computing.
+///   Cjyx is moving towards using this coordinate system in all files by default
+///   (while keep using RAS coordinate system internally).
+/// RAS coordinate system is used in Cjyx internally. For many years, Cjyx used
+///   this coordinate system in files that it created, too.
+enum
+{
+  CoordinateSystemRAS = 0,
+  CoordinateSystemLPS = 1,
+};
+
+
+// https://stackoverflow.com/questions/216823/whats-the-best-way-to-trim-stdstring
+// trim from start (in place)
+static inline void
+ltrim(std::string & s)
+{
+  s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) { return !std::isspace(ch); }));
+}
+
+// trim from end (in place)
+static inline void
+rtrim(std::string & s)
+{
+  s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) { return !std::isspace(ch); }).base(), s.end());
+}
+
+// trim from both ends (in place)
+static inline void
+trim(std::string & s)
+{
+  ltrim(s);
+  rtrim(s);
+}
+
+#if 0
+// trim from start (copying)
+static inline std::string ltrim_copy(std::string s) {
+  ltrim(s);
+  return s;
+}
+
+// trim from end (copying)
+static inline std::string rtrim_copy(std::string s) {
+  rtrim(s);
+  return s;
+}
+
+// trim from both ends (copying)
+static inline std::string trim_copy(std::string s) {
+  trim(s);
+  return s;
+}
+#endif
+
+
+LandmarksWeightMapType
+ReadLandmarkWeights(const std::string & weightFilename)
+{
+  std::ifstream weightFileStream(weightFilename.c_str());
+
+  if (!weightFileStream.is_open())
+  {
+    std::cerr << "Fail to open weight file " << std::endl;
+    throw itk::ImageFileReaderException(
+      __FILE__, __LINE__, "Couldn't open landmark weight file for reading", ITK_LOCATION);
+  }
+
+  std::string            line;
+  LandmarksWeightMapType landmarkWeightMap;
+  while (getline(weightFileStream, line))
+  {
+    trim(line);
+
+    const size_t      firstComma = line.find(',', 0);
+    const std::string landmark = line.substr(0, firstComma);
+    if (line[0] == '#' || line.empty() ||
+        landmark ==
+          "Landmark") // For backwards compatibility, if the landmark name is "Landmark" then it is the header row.
+    {
+      continue;
+    }
+    const float weight = std::stod((line.substr(firstComma + 1, line.length() - 1)).c_str());
+    landmarkWeightMap[landmark] = weight;
+  }
+  return landmarkWeightMap;
+}
+
+
+static void
+WriteITKtoCjyx3LmkOldCjyx3(const std::string & landmarksFilename, const LandmarksMapType & landmarks)
+{
+  itk::NumberToString<double> doubleConvert;
+  const std::string fullPathLandmarksFileName = itksys::SystemTools::CollapseFullPath(landmarksFilename.c_str());
+
+  std::stringstream lmkPointStream;
+
+  unsigned int numNamedLandmarks = 0;
+
+  for (const auto & landmark : landmarks)
+  {
+    if ((landmark.first).compare("") != 0)
+    {
+      // NOTE: Cjyx3 use RAS coordinate system to represent landmarks
+      // but ITK landmarks are in LPS, so we need to negate the first two
+      // component of the landmark points.
+      lmkPointStream << landmark.first << "," << doubleConvert(-(landmark.second[0])) << ","
+                     << doubleConvert(-(landmark.second[1])) << "," << doubleConvert(+(landmark.second[2]))
+                     << ",1,1\n"; // Note the last two columns are
+      // ,visible,editable
+      ++numNamedLandmarks;
+    }
+  }
+
+  std::stringstream lmksStream;
+  // Write the .fcvs header information.
+  lmksStream << "#Fiducial List file " << fullPathLandmarksFileName << std::endl;
+  lmksStream << "#numPoints = " << numNamedLandmarks << "\n";
+  lmksStream << "#symbolScale = 5" << std::endl;
+  lmksStream << "#visibility = 1" << std::endl;
+  lmksStream << "#textScale = 4.5" << std::endl;
+  lmksStream << "#color = 0.4,1,1" << std::endl;
+  lmksStream << "#selectedColor = 1,0.5,0.5" << std::endl;
+  lmksStream << "#label,x,y,z,sel,vis" << std::endl;
+  lmksStream << lmkPointStream.str();
+
+  // Now write file to disk
+  std::ofstream myfile;
+  myfile.open(fullPathLandmarksFileName.c_str());
+  if (!myfile.is_open())
+  {
+    std::cerr << "Error: Can't write Cjyx3 landmark file " << fullPathLandmarksFileName << std::endl;
+    std::cerr.flush();
+    throw itk::ImageFileReaderException(__FILE__, __LINE__, "Couldn't open landmarks file for writing", ITK_LOCATION);
+  }
+  myfile << lmksStream.str();
+  myfile.close();
+}
+
+
+static void
+WriteITKtoCjyx3LmkCjyx4(const std::string & landmarksFilename, const LandmarksMapType & landmarks)
+{
+  itk::NumberToString<double> doubleConvert;
+  const std::string fullPathLandmarksFileName = itksys::SystemTools::CollapseFullPath(landmarksFilename.c_str());
+
+  std::stringstream lmkPointStream;
+  unsigned int      numNamedLandmarks = 0;
+  for (const auto & landmark : landmarks)
+  {
+    if ((landmark.first).compare("") != 0)
+    {
+      // NOTE: Cjyx4 Markups use RAS coordinate system to represent landmarks
+      // but ITK landmarks are in LPS, so we need to negate the first two
+      // component of the landmark points.
+      lmkPointStream << "vtkDRMLMarkupsFiducialNode_" << numNamedLandmarks << ",";
+
+      lmkPointStream << doubleConvert(-(landmark.second[0])) << "," << doubleConvert(-(landmark.second[1])) << ","
+                     << doubleConvert(+(landmark.second[2])) << ",0,0,0,1,1,1,0," << landmark.first << ",,"
+                     << std::endl; // Note the last two columns are
+      ++numNamedLandmarks;
+    }
+  }
+
+  std::stringstream lmksStream;
+  // Write the .fcvs header information.
+  lmksStream << "# Markups fiducial file version = 4.6" << std::endl;
+  lmksStream << "# CoordinateSystem = 0" << std::endl; // 0=RAS 1=LPS
+  lmksStream << "# columns = id,x,y,z,ow,ox,oy,oz,vis,sel,lock,label,desc,associatedNodeID" << std::endl;
+  lmksStream << lmkPointStream.str();
+
+  // Now write file to disk
+  std::ofstream myfile;
+  myfile.open(fullPathLandmarksFileName.c_str());
+  if (!myfile.is_open())
+  {
+    std::cerr << "Error: Can't write Cjyx3 landmark file " << fullPathLandmarksFileName << std::endl;
+    std::cerr.flush();
+    throw itk::ImageFileReaderException(__FILE__, __LINE__, "Couldn't open landmarks file for writing", ITK_LOCATION);
+  }
+  myfile << lmksStream.str();
+  myfile.close();
+}
+
+
+static LandmarksMapType
+ReadCjyx3toITKLmkOldCjyx(const std::string & landmarksFilename)
+{
+  LandmarksMapType landmarks;
+  std::string      landmarksFilenameTmp = itksys::SystemTools::CollapseFullPath(landmarksFilename.c_str());
+  std::ifstream    myfile(landmarksFilenameTmp.c_str());
+
+  if (!myfile.is_open())
+  {
+    std::cerr << "Error: Failed to load landmarks file!" << std::endl;
+    std::cerr.flush();
+    std::string errorMsg = std::string("Couldn't open landmarks file for reading: ") + landmarksFilename;
+    throw itk::ImageFileReaderException(__FILE__, __LINE__, errorMsg.c_str(), ITK_LOCATION);
+    // do not return empty landmarks
+  }
+  bool        useLPS = false;
+  std::string version_major_str = "unknown";
+  std::string version_minor_str = "unknown";
+  std::string coordinate_str = "RAS"; // Match old cjyx version RAS strings
+  std::string line;
+  while (getline(myfile, line))
+  {
+    if (line.compare(0, 1, "#") == 0) // Process header lines
+    {
+      // Process comment files
+      if (line.find("version") != std::string::npos)
+      {
+        // Extract version number
+        std::regex  re("# *Markups *fiducial *file *version *= (.*)");
+        std::smatch match;
+        if (std::regex_search(line, match, re) && match.size() > 1)
+        {
+          version_major_str = match.str(1);
+          version_minor_str = match.str(2);
+        }
+      }
+      else if (line.find("CoordinateSystem") != std::string::npos)
+      {
+        // extract coordinate system.
+        std::regex  re("# *CoordinateSystem *= *(.*)");
+        std::smatch match;
+        if (std::regex_search(line, match, re) && match.size() > 1)
+        {
+          coordinate_str = match.str(1);
+        }
+        if (coordinate_str.find("LPS") != std::string::npos || coordinate_str.find('1') != std::string::npos)
+        {
+          useLPS = true;
+        }
+        else if (coordinate_str.find("RAS") != std::string::npos || coordinate_str.find('0') != std::string::npos)
+        {
+          useLPS = false;
+        }
+        else // Unkonwn coordinate stsystem
+        {
+          useLPS = false;
+        }
+      }
+    }
+    else // Process landmark lines
+    {
+      size_t            pos1 = line.find(',', 0);
+      const std::string name = line.substr(0, pos1);
+      LandmarkPointType labelPos;
+      for (unsigned int i = 0; i < 3; ++i)
+      {
+        const size_t pos2 = line.find(',', pos1 + 1);
+        labelPos[i] = std::stod(line.substr(pos1 + 1, pos2 - pos1 - 1).c_str());
+        if (!useLPS && i < 2) // Negate first two components for RAS -> LPS is the file is NOT an LPS file
+        {
+          labelPos[i] *= -1;
+        }
+        pos1 = pos2;
+      }
+      landmarks[name] = labelPos;
+    }
+  }
+
+  myfile.close();
+  return landmarks;
+}
+
+static std::vector<std::string>
+split(const std::string & s, char delim)
+{
+  std::stringstream        ss(s);
+  std::string              item;
+  std::vector<std::string> tokens;
+  while (getline(ss, item, delim))
+  {
+    tokens.push_back(item);
+  }
+  return tokens;
+}
+
+static LandmarksMapType
+ReadCjyx3toITKLmkCjyx4(const std::string & landmarksFilename)
+{
+  LandmarksMapType landmarks;
+
+  std::string   landmarksFilenameTmp = itksys::SystemTools::CollapseFullPath(landmarksFilename.c_str());
+  std::ifstream myfile(landmarksFilenameTmp.c_str());
+
+  if (!myfile.is_open())
+  {
+    std::cerr << "Error: Failed to load landmarks file!" << std::endl;
+    std::cerr.flush();
+    std::string errorMsg = std::string("Couldn't open landmarks file for reading: ") + landmarksFilename;
+    throw itk::ImageFileReaderException(__FILE__, __LINE__, errorMsg.c_str(), ITK_LOCATION);
+    // do not return empty landmarks
+  }
+  bool        useLPS = false;
+  std::string version_major_str = "unknown";
+  std::string version_minor_str = "unknown";
+  std::string coordinate_str = "RAS"; // Match old cjyx version RAS strings
+  std::string line;
+  while (getline(myfile, line))
+  {
+    if (line.compare(0, 1, "#") == 0) // Process header lines
+    {
+      // Process comment files
+      if (line.find("version") != std::string::npos)
+      {
+        // Extract version number
+        std::regex  re("# *Markups *fiducial *file *version *= ([0-9]*)\\.([0-9]*)");
+        std::smatch match;
+        if (std::regex_search(line, match, re) && match.size() > 1)
+        {
+          version_major_str = match.str(1);
+          version_minor_str = match.str(2);
+        }
+      }
+      else if (line.find("CoordinateSystem") != std::string::npos)
+      {
+        // extract coordinate system.
+        std::regex  re("# *CoordinateSystem *= *(.*)");
+        std::smatch match;
+        if (std::regex_search(line, match, re) && match.size() > 1)
+        {
+          coordinate_str = match.str(1);
+        }
+        if (coordinate_str.find("LPS") != std::string::npos || coordinate_str.find('1') != std::string::npos)
+        {
+          useLPS = true;
+        }
+        else if (coordinate_str.find("RAS") != std::string::npos || coordinate_str.find('0') != std::string::npos)
+        {
+          useLPS = false;
+        }
+        else // Unkonwn coordinate system
+        {
+          useLPS = false;
+        }
+      }
+    }
+    else // Process landmark lines
+    {
+      //             0 1 2 3  4  5  6  7   8   9   10    11   12               13
+      //# columns = id,x,y,z,ow,ox,oy,oz,vis,sel,lock,label,desc,associatedNodeID
+      std::vector<std::string> asTokens = split(line, ',');
+      const std::string        name = asTokens[11]; // 11 position is label name
+      LandmarkPointType        labelPos;
+      if (useLPS)
+      {
+        labelPos[0] = +atof(asTokens[1].c_str()); // L -> L (+)
+        labelPos[1] = +atof(asTokens[2].c_str()); // P -> P (+)
+      }
+      else
+      {
+        labelPos[0] = -atof(asTokens[1].c_str()); // R -> L (-)
+        labelPos[1] = -atof(asTokens[2].c_str()); // A -> P (-)
+      }
+      labelPos[2] = +atof(asTokens[3].c_str()); // S -> S (+)
+      landmarks[name] = labelPos;
+    }
+  }
+  myfile.close();
+  return landmarks;
+}
+
+
+LandmarksMapType
+ReadCjyx3toITKLmk(const std::string & landmarksFilename)
+{
+  if (!itksys::SystemTools::FileExists(landmarksFilename))
+  {
+    const std::string errorMsg = std::string("Error: Landmarks file not found at ") + landmarksFilename;
+    throw itk::ImageFileReaderException(__FILE__, __LINE__, errorMsg.c_str(), ITK_LOCATION);
+  }
+
+  std::ifstream myfile(landmarksFilename);
+  if (!myfile.is_open())
+  {
+    std::cerr << "Error: Failed to load landmarks file!" << std::endl;
+    std::cerr.flush();
+    std::string errorMsg = std::string("Couldn't open landmarks file for reading: ") + landmarksFilename;
+    throw itk::ImageFileReaderException(__FILE__, __LINE__, errorMsg.c_str(), ITK_LOCATION);
+    // do not return empty landmarks
+  }
+  std::string firstLine;
+  std::getline(myfile, firstLine);
+  myfile.close();
+  if (firstLine.find("Fiducial List") != std::string::npos)
+  {
+    const LandmarksMapType landmarks = ReadCjyx3toITKLmkOldCjyx(landmarksFilename);
+    return landmarks;
+  }
+  else if (firstLine.find("Markups fiducial file") != std::string::npos)
+  {
+    const LandmarksMapType landmarks = ReadCjyx3toITKLmkCjyx4(landmarksFilename);
+    return landmarks;
+  }
+  else
+  {
+    itkGenericExceptionMacro(<< "ERROR:  Unrecognized landmark file format for " << landmarksFilename);
+  }
+}
+
+void
+WriteITKtoCjyx3Lmk(const std::string &             landmarksFilename,
+                     const LandmarksMapType &        landmarks,
+                     const CJYX_LANDMARK_FILE_TYPE cjyxLmkType)
+{
+  switch (cjyxLmkType)
+  {
+    case CJYX_V3_FCSV:
+      WriteITKtoCjyx3LmkOldCjyx3(landmarksFilename, landmarks);
+      break;
+    case CJYX_V4_FCSV:
+      WriteITKtoCjyx3LmkCjyx4(landmarksFilename, landmarks);
+      break;
+    case CJYX_FCSV_BEGIN:
+      itkGenericExceptionMacro(<< "ERROR:  MODE NOT IMPLEMENTED FOR LANDMARK WRITING (CJYX_FCSV_BEGIN)");
+      ITK_FALLTHROUGH;
+    case CJYX_FCSV_END:
+      itkGenericExceptionMacro(<< "ERROR:  MODE NOT IMPLEMENTED FOR LANDMARK WRITING (CJYX_FCSV_END)");
+      ITK_FALLTHROUGH;
+    default:
+      /* Do Nothing */
+      itkGenericExceptionMacro(<< "ERROR:  MODE NOT IMPLEMENTED FOR LANDMARK WRITING (No Match): " << cjyxLmkType);
+      break;
+  }
+}

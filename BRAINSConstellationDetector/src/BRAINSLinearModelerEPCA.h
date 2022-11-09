@@ -1,0 +1,90 @@
+/*=========================================================================
+ *
+ *  Copyright SINAPSE: Scalable Informatics for Neuroscience, Processing and Software Engineering
+ *            The University of Iowa
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0.txt
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ *=========================================================================*/
+/*
+ * Author: Wei Lu
+ * at Psychiatry Imaging Lab, University of Iowa Health Care, 2010
+ */
+
+#ifndef __BRAINSLinearModelerEPCA__h
+#define __BRAINSLinearModelerEPCA__h
+
+#include "Cjyx3LandmarkIO.h"
+#include "itkPoint.h"
+#include "vnl/vnl_matrix.h"
+#include "vnl/vnl_vector_fixed.h"
+#include "vnl/algo/vnl_symmetric_eigensystem.h"
+#include <string>
+#include <fstream>
+#include <iostream>
+
+// typedef
+constexpr unsigned int PointDim = 3;
+using PointType = itk::Point<double, PointDim>;
+using DatasetMapType = std::map<std::string, PointType>;
+using LmkDBType = std::map<std::string, DatasetMapType>;
+using MatrixType = vnl_matrix<double>;
+using VectorType = vnl_vector_fixed<double, PointDim>;
+using MatrixMapType = std::map<std::string, MatrixType>;
+using VectorMapType = std::map<std::string, VectorType>;
+
+/*
+ * Description:
+ * Training linear model using EPCA
+ * Implementation based on my MS thesis,
+ * "A METHOD FOR AUTOMATED LANDMARK CONSTELLATION DETECTION USING
+ * EVOLUTIONARY PRINCIPAL COMPONENTS AND STATISTICAL SHAPE MODELS"
+ */
+int
+BRAINSLinearModelerEPCAPrimary(int argc, char * argv[]);
+
+/*
+ * Build up the landmark database from a list of fcsv files
+ * Input:
+ * filename ...
+ */
+void
+CreateLmkDB(const std::string & filename, LmkDBType & baseLmkDB, LmkDBType & EPCALmkDB);
+
+/*
+ * Initialize X_i matrix from base landmarks
+ */
+MatrixType
+InitializeXi(LmkDBType & baseLmkDB);
+
+/*
+ * Compute the principal components of landmark vector space
+ * in each iteration
+ * Input:
+ */
+void
+ComputeEPCAModel(MatrixMapType & MMatrixMap, VectorMapType & SVectorMap, LmkDBType & baseLmkDB, LmkDBType & EPCALmkDB);
+
+/*
+ * Compute the s_i vector from X_i matrix
+ */
+VectorType
+ComputeSVector(const MatrixType & X_i);
+
+/*
+ * Compute the I_si matrix from X_i and s_i
+ */
+MatrixType
+ComputeIsiMatrix(const unsigned int rows, const unsigned int columns, const VectorType & s_i);
+
+#endif
